@@ -1,0 +1,29 @@
+# ============================
+# 1. Usamos una imagen base de Python
+# ============================
+FROM python:3.9-slim
+
+# ============================
+# 2. Establecemos el directorio de trabajo
+# ============================
+WORKDIR /usr/src/app
+
+# ============================
+# 3. Copiamos los archivos de la aplicación
+# ============================
+COPY app.py app.py
+# ============================
+# 4. Instalamos las dependencias
+# ============================
+COPY requirements.txt requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ============================
+# 5. Exponemos el puerto que usará la API
+# ============================
+EXPOSE 5000
+
+# ============================
+# 6. Definimos el comando para ejecutar la app
+# ============================
+CMD ["gunicorn","-w","1","-b", "0.0.0.0:5000", "app:app","--log-level","debug"]
