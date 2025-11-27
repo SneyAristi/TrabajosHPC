@@ -17,16 +17,16 @@ docker swarm init
 ```
 Si ya tienes un Swarm activo, puedes omitir este paso.
 
-### 3) Desplegar la pila
+### 3) Crear el servicio en Swarm
 ```bash
-docker stack deploy -c docker-compose.yml tsp-stack
+docker service create --name calculator --replicas 4 -p 5000:5000 calculator:1
 ```
-Esto creará el servicio `api` con 4 réplicas y la red overlay `webnet`.
+Esto levantará el servicio `calculator` con 4 réplicas exponiendo el puerto 5000.
 
 ### 4) Verificar que esté corriendo
 ```bash
 docker service ls
-docker service ps tsp-stack_api
+docker service ps calculator
 ```
 
 ### 5) Ejecutar el script de fuerza bruta
@@ -43,7 +43,7 @@ El script generará todas las permutaciones de las ciudades, llamará al endpoin
 
 ### 6) Detener y limpiar
 ```bash
-docker stack rm tsp-stack
+docker service rm calculator
 ```
 
 ### Estructura relevante
