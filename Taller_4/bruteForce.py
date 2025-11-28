@@ -1,120 +1,171 @@
+import csv
 import itertools
-import requests
+import logging
+import os
+import random
+import time
+from pathlib import Path
+import aiohttp
+import asyncio
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+
+CALCULATOR_URL = os.environ.get(
+    "CALCULATOR_URL",
+    "http://localhost:5000/calculate_distance",
+)
+SECUENCIAL = 0
+NUM_CITIES = 9
+METRICS_CSV = Path("metrics_cluster.csv")
+NUMBER_OF_RUNS = 1
+
 # =========================================
 # 1. Datos de Entrada: Lista de Ciudades
 # =========================================
-cities = [
-    { "id": "A", "x": 0.0, "y": 0.0 },
-    { "id": "B", "x": 3.0, "y": 4.0 },
-    { "id": "C", "x": 30.0, "y": 8.0 },
-    { "id": "D", "x": 9.0, "y": 12.0 },
-    { "id": "E", "x": 12.0, "y": 16.0 },
-    { "id": "F", "x": 15.0, "y": 20.0 }
-]
+def generate_random_cities(num_cities):
+    """
+    Genera num_cities ciudades con coordenadas aleatorias en el plano [0,100]x[0,100].
+    """
+    rng = random.Random()
+    cities_local = []
+    for idx in range(num_cities):
+        city_id = f"C{idx + 1}"
+        cities_local.append(
+            {
+                "id": city_id,
+                "x": rng.uniform(0, 100),
+                "y": rng.uniform(0, 100),
+            }
+        )
+    return cities_local
 
 # =========================================
 # 2. Generación de Rutas: Permutaciones de Ciudades
 # =========================================
 def generate_paths(cities):
     """
-    Función que genera todas las posibles permutaciones de las ciudades.
-
-    Parametros:
-    cities (list): Lista de diccionarios con los identificadores de ciudades y sus coordenadas.
-
-    Retorno:
-    list: Lista con todas las permutaciones posibles de los identificadores de las ciudades.
+    Crea todas las permutaciones posibles de ciudades y las devuelve como un iterable.
     """
-    # Crear una lista solo con los ids de las ciudades
     city_ids = [city["id"] for city in cities]
-    # Generar todas las permutaciones posibles
-    return list(itertools.permutations(city_ids))
+    return itertools.permutations(city_ids)
 
 # =========================================
-# 3. Cálculo de Distancia: Solicitud a la API
+# 3. Cálculo de Distancia Asíncrono: Solicitud a la API
 # =========================================
-def calculate_distance(path):
+async def calculate_distance(session, path, city_map):
     """
-    Función que calcula la distancia total de una ruta utilizando la API Flask.
-
-    Parametros:
-    path (tuple): Tupla con el orden de los identificadores de las ciudades a visitar.
-
-    Retorno:
-    float: Distancia total de la ruta calculada por la API.
+    Función asíncrona para calcular la distancia de una ruta utilizando una solicitud HTTP.
     """
-    # Definir la URL del servicio RESTful de la API de Flask que calcula la distancia
-    url = "http://localhost:5000/calculate_distance"  # Ajustar según el servicio en Docker Swarm
-
-    # Preparar el cuerpo de la solicitud (JSON)
-    payload = {
-        "cities": []
-    }
+    payload = {"cities": []}
 
     for city_id in path:
-        # Buscar las coordenadas de la ciudad correspondiente a city_id
-        city_data = next((city for city in cities if city["id"] == city_id), None)
-        
+        city_data = city_map.get(city_id)
+
         if city_data:
-            payload["cities"].append({
-                "id": city_id,
-                "x": city_data["x"],
-                "y": city_data["y"]
-            })
+            payload["cities"].append(
+                {
+                    "id": city_id,
+                    "x": city_data["x"],
+                    "y": city_data["y"],
+                }
+            )
         else:
-            print(f"Error: Ciudad con id {city_id} no encontrada.")
-            return None
+            raise ValueError(f"Ciudad con id {city_id} no encontrada.")
 
-    # Hacer la solicitud POST a la API para obtener la distancia total
-    response = requests.post(url, json=payload)
-    
-    if response.status_code == 200:
-        # Si la respuesta es exitosa, devolver la distancia total
-        return response.json()["total_distance"]
-    else:
-        # Si algo falla, retornar None
-        print(f"Error en la solicitud: {response.status_code}")
-        return None
-
+    # Realiza la solicitud POST de manera asíncrona
+    async with session.post(CALCULATOR_URL, json=payload) as response:
+        if response.status == 200:
+            result = await response.json()
+            return result["total_distance"]
+        response.raise_for_status()
 
 # =========================================
-# 4. Optimización de la Ruta: Encontrar la Mejor Ruta
+# 4. Función para Grabar Métricas en CSV
 # =========================================
-def find_best_path():
+def append_metrics_row(row):
     """
-    Función que encuentra la mejor ruta (la ruta más corta) entre todas las permutaciones de las ciudades.
-
-    Este proceso genera todas las permutaciones posibles de las ciudades, calcula la distancia de cada ruta
-    usando la función `calculate_distance`, y mantiene un registro de la mejor ruta encontrada.
-
-    Retorno:
-    None: Imprime la mejor ruta y su distancia en consola.
+    Registra métricas en un archivo CSV, creando el archivo si no existe.
     """
-    # Generar todas las permutaciones posibles de las ciudades
-    paths = generate_paths(cities)
-    # Inicializar variables para almacenar la mejor ruta y su distancia
+    METRICS_CSV.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "num_cities",
+        "paths_processed",
+        "best_distance",
+        "duration_s",
+    ]
+    exists = METRICS_CSV.exists()
+    with METRICS_CSV.open("a", newline="") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+# =========================================
+# 5. Optimización de la Ruta: Encontrar la Mejor Ruta
+# =========================================
+async def find_best_path(cities):
+    """
+    Función asíncrona que encuentra la mejor ruta entre las ciudades utilizando múltiples tareas en paralelo.
+    """
     best_path = None
-    best_distance = float('inf')  # Iniciar con una distancia infinita
-    
-    # Iterar sobre cada ruta generada
-    for path in paths:
-        # Calcular la distancia de la ruta actual
-        distance = calculate_distance(path)
-        
-        if distance is not None and distance < best_distance:
-            # Si la distancia calculada es mejor que la mejor encontrada hasta ahora
-            best_distance = distance
-            best_path = path
-    
-    # Imprimir el resultado final
+    best_distance = float('inf')  # Inicializamos con una distancia infinita
+    total_paths = 0
+    started = time.perf_counter()
+
+    # Generamos las rutas (permutaciones)
+    paths = generate_paths(cities)
+    city_map = {city["id"]: city for city in cities}
+
+    # Inicia una sesión asíncrona para las solicitudes HTTP
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        for path in paths:
+            # Para cada ruta, creamos una tarea asíncrona para calcular la distancia
+            tasks.append(calculate_distance(session, path, city_map))
+
+        # Ejecutamos todas las tareas en paralelo y esperamos los resultados
+        distances = await asyncio.gather(*tasks)
+
+        # Procesamos los resultados de las distancias
+        for i, distance in enumerate(distances):
+            if distance < best_distance:
+                best_distance = distance
+                best_path = list(itertools.islice(generate_paths(cities), i, i+1))[0]  # Obtener el path correspondiente
+
+            total_paths += 1
+
+    elapsed = time.perf_counter() - started
     if best_path:
-        print(f"La mejor ruta es: {' -> '.join(best_path)}")
-        print(f"Con una distancia total de: {best_distance} unidades")
+        logging.info("La mejor ruta es: %s", " -> ".join(best_path))
+        logging.info("Con una distancia total de: %.4f unidades", best_distance)
+        logging.info("Tiempo: %.4f", elapsed)
     else:
-        print("No se pudo encontrar una ruta válida.")
+        logging.error("No se pudo encontrar una ruta válida.")
+
+    append_metrics_row(
+        {
+            "num_cities": len(cities),
+            "paths_processed": total_paths,
+            "best_distance": best_distance if best_path else "",
+            "duration_s": round(elapsed, 4),
+        }
+    )
 
 # =========================================
-# 5. Ejecutar la Búsqueda de la Mejor Ruta
+# 6. Ejecutar la Búsqueda de la Mejor Ruta
 # =========================================
 if __name__ == "__main__":
-    find_best_path()
+    if SECUENCIAL:
+        for i in range(2, NUM_CITIES + 1):
+            for _ in range(NUMBER_OF_RUNS):
+                cities = generate_random_cities(i)
+                # Ejecutamos la búsqueda de la mejor ruta de forma secuencial
+                asyncio.run(find_best_path(cities))
+    else:
+        for _ in range(NUMBER_OF_RUNS):
+            cities = generate_random_cities(NUM_CITIES)
+            # Ejecutamos la búsqueda de la mejor ruta de forma asíncrona
+            asyncio.run(find_best_path(cities))
